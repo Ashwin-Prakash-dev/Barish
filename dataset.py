@@ -258,3 +258,8 @@ def _clone_dataset(src, samples, augment):
     ds.augment   = augment
     ds.samples   = samples
     return ds
+
+
+# Public aliases for external scripts
+discover_samples     = _discover_samples
+event_name_from_path = _event_name_from_path

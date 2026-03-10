@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
-from dataset import SenForFloodsDataset, discover_samples
+from dataset import SenForFloodsDataset, discover_samples, event_name_from_path
 from model   import build_model
 from losses  import DiceFocalLoss
 from metrics import FloodMetrics
@@ -65,7 +65,7 @@ def set_seed(seed):
 def split_events(data_dir, val_split, val_events, seed):
     """Return (train_events, val_events) lists of event name strings."""
     samples     = discover_samples(data_dir)
-    all_events  = sorted({en for _, _, en in samples})
+    all_events  = sorted({event_name_from_path(s["mask"]) for s in samples})
     print(f"Found {len(all_events)} events: {all_events}")
 
     if val_events:
@@ -91,13 +91,9 @@ def get_dataloaders(args):
         args.data_dir, args.val_split, args.val_events, args.seed
     )
 
-    train_ds = SenForFloodsDataset(args.data_dir, use_aux=use_aux,
-                                   augment=True,  events=train_evs)
-    val_ds   = SenForFloodsDataset(args.data_dir, use_aux=use_aux,
-                                   augment=False, events=val_evs)
-
-    train_ds.summary()
-    val_ds.summary()
+    full_ds            = SenForFloodsDataset(args.data_dir, use_aux=use_aux, augment=False)
+    train_ds, val_ds   = full_ds.event_split(val_evs)
+    train_ds.augment   = True
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True)

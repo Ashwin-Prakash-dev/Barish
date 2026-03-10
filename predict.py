@@ -91,7 +91,7 @@ def main():
     # ── Inference loop ────────────────────────────────────────────────────────
     with torch.no_grad():
         for idx in range(len(ds)):
-            sid = ds.sample_ids[idx]
+            sid = ds.samples[idx]["tile_id"]
             batch = ds[idx]
 
             if use_aux:
