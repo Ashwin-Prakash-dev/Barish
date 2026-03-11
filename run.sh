@@ -12,7 +12,7 @@ set -e
 
 # ── Config (edit these) ───────────────────────
 ENV_NAME="barish"
-DATA_DIR="D:/barish/CEMS"
+DATA_DIR="D:/barish/data/SenForFlood/CEMS"
 OUT_DIR="D:/barish/runs/exp1"
 PRED_DIR="D:/barish/predictions"
 CHECKPOINT="$OUT_DIR/best.pth"
