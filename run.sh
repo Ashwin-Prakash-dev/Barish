@@ -13,8 +13,9 @@ set -e
 # ── Config (edit these) ───────────────────────
 ENV_NAME="barish"
 DATA_DIR="D:/barish/data/SenForFlood/CEMS"
-OUT_DIR="D:/barish/runs/exp1"
-PRED_DIR="D:/barish/predictions"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+OUT_DIR="D:/barish/runs/exp2_$TIMESTAMP"
+PRED_DIR="D:/barish/predictions/exp2_$TIMESTAMP"
 CHECKPOINT="$OUT_DIR/best.pth"
 
 EPOCHS=50
@@ -38,6 +39,7 @@ setup() {
 
 train() {
     echo ">>> Training TwinFloodNet ..."
+    mkdir -p "$OUT_DIR"
     conda run -n "$ENV_NAME" python -u train.py \
         --data_dir   "$DATA_DIR" \
         --out_dir    "$OUT_DIR" \
@@ -51,6 +53,7 @@ train() {
 
 predict() {
     echo ">>> Running inference ..."
+    mkdir -p "$PRED_DIR"
     conda run -n "$ENV_NAME" python -u predict.py \
         --checkpoint "$CHECKPOINT" \
         --data_dir   "$DATA_DIR" \
