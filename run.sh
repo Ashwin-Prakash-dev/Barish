@@ -31,6 +31,25 @@ EXTRA_FLAGS=""
 $AMP     && EXTRA_FLAGS="$EXTRA_FLAGS --amp"
 $USE_AUX || EXTRA_FLAGS="$EXTRA_FLAGS --no_aux"
 
+cleanup_old_runs() {
+    local parent_dir="$1"
+    local pattern="$2"
+
+    # Count directories matching pattern
+    local count=$(ls -1d "$parent_dir"/$pattern 2>/dev/null | wc -l)
+
+    if [ $count -ge 10 ]; then
+        # Keep 9 newest, delete older ones
+        local dirs_to_delete=$(ls -1dt "$parent_dir"/$pattern 2>/dev/null | tail -n +10)
+        while IFS= read -r dir; do
+            if [ -n "$dir" ]; then
+                echo ">>> Deleting old run: $dir"
+                rm -rf "$dir"
+            fi
+        done <<< "$dirs_to_delete"
+    fi
+}
+
 setup() {
     echo ">>> Creating conda environment '$ENV_NAME' ..."
     conda env create -f environment.yml
@@ -39,6 +58,7 @@ setup() {
 
 train() {
     echo ">>> Training TwinFloodNet ..."
+    cleanup_old_runs "D:/barish/runs" "exp2_*"
     mkdir -p "$OUT_DIR"
     conda run -n "$ENV_NAME" python -u train.py \
         --data_dir   "$DATA_DIR" \
@@ -53,6 +73,7 @@ train() {
 
 predict() {
     echo ">>> Running inference ..."
+    cleanup_old_runs "D:/barish/predictions" "exp2_*"
     mkdir -p "$PRED_DIR"
     conda run -n "$ENV_NAME" python -u predict.py \
         --checkpoint "$CHECKPOINT" \
