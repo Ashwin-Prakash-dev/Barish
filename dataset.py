@@ -47,7 +47,9 @@ LULC_MAP     = {v: i for i, v in enumerate(LULC_CLASSES)}
 
 
 def safe_log(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    return 10.0 * np.log10(np.clip(x.astype(np.float32), eps, None))
+    x = x.astype(np.float32)
+    x = np.where(np.isfinite(x), x, eps)
+    return 10.0 * np.log10(np.clip(x, eps, None))
 
 
 def encode_lulc(lulc: np.ndarray) -> np.ndarray:
@@ -162,6 +164,7 @@ class SenForFloodsDataset(Dataset):
             img = img[:, :, np.newaxis]
         if self.log_scale:
             img = safe_log(img)
+            img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
         c = img.shape[2]
         img = (img - S1_MEAN[:c]) / S1_STD[:c]
         return img.transpose(2, 0, 1)
@@ -193,6 +196,10 @@ class SenForFloodsDataset(Dataset):
             arrays = tuple(np.flip(a, axis=-1).copy() for a in arrays)
         if np.random.rand() > 0.5:
             arrays = tuple(np.flip(a, axis=-2).copy() for a in arrays)
+        # Random 90° rotation (avoids interpolation artefacts on masks)
+        k = np.random.randint(0, 4)
+        if k > 0:
+            arrays = tuple(np.rot90(a, k=k, axes=(-2, -1)).copy() for a in arrays)
         return arrays
 
     def __len__(self):
@@ -223,6 +230,11 @@ class SenForFloodsDataset(Dataset):
                 before, during, aux, mask = aug
             else:
                 before, during, mask = aug
+
+        # Gaussian noise on normalised SAR channels (train only, after augmentation)
+        if self.augment:
+            before = before + np.random.normal(0.0, 0.1, before.shape).astype(np.float32)
+            during = during + np.random.normal(0.0, 0.1, during.shape).astype(np.float32)
 
         before_t = torch.from_numpy(before.copy())
         during_t = torch.from_numpy(during.copy())

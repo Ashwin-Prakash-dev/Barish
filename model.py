@@ -5,29 +5,31 @@ A Siamese encoder-decoder that processes a (before, during) pair of
 Sentinel-1 images and optionally fuses terrain + LULC auxiliary data
 to produce a per-pixel flood probability map.
 
+Encoder
+-------
+Uses a pretrained backbone from segmentation-models-pytorch (default: resnet34).
+Both branches share the same encoder weights (Siamese).
+The first conv is automatically adapted by smp for 4-channel SAR input by
+averaging the pretrained RGB weights across the channel dimension.
+
 Architecture overview
 ---------------------
-                ┌──────────────┐     ┌──────────────┐
-  s1_before ──► │  Shared      │     │  Shared      │ ◄── s1_during
-                │  Encoder     │     │  Encoder     │
-                └──────┬───────┘     └──────┬───────┘
-                       │  e_before          │  e_during
-                       └────────┬───────────┘
-                            change module
-                         (diff + concat + conv)
-                                 │
-                    optional auxiliary injection
-                         (terrain + LULC)
-                                 │
-                         Decoder (UNet-style)
-                                 │
-                         logit map (H × W × 1)
+  s1_before ──► [ Shared pretrained encoder ] ──► feats_b [/2 … /32]
+  s1_during ──► [ Shared pretrained encoder ] ──► feats_d [/2 … /32]
+                            │
+              ChangeModule + CBAM at each scale
+                            │
+              optional auxiliary injection (terrain + LULC)
+                            │
+              Decoder UpBlocks (with Dropout2d)
+                            │
+              Main logit map + deep supervision heads (training only)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,31 +61,49 @@ class ResBlock(nn.Module):
         return self.act(x + self.body(x))
 
 
-class DownBlock(nn.Module):
-    """Conv → BN → ReLU → MaxPool, returns (after_pool, before_pool)."""
-    def __init__(self, in_ch: int, out_ch: int):
+class CBAM(nn.Module):
+    """
+    Convolutional Block Attention Module — channel + spatial gates.
+    Applied after each ChangeModule to focus on flood-relevant change patterns.
+    """
+    def __init__(self, ch: int, reduction: int = 8):
         super().__init__()
-        self.conv = nn.Sequential(ConvBnRelu(in_ch, out_ch), ResBlock(out_ch))
-        self.pool = nn.MaxPool2d(2, 2)
+        mid = max(1, ch // reduction)
+        self.channel_att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(ch, mid),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, ch),
+            nn.Sigmoid(),
+        )
+        self.spatial_att = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid(),
+        )
 
     def forward(self, x):
-        feat = self.conv(x)
-        return self.pool(feat), feat          # pooled, skip
+        w = self.channel_att(x).unsqueeze(-1).unsqueeze(-1)
+        x = x * w
+        avg = x.mean(dim=1, keepdim=True)
+        mx  = x.max(dim=1, keepdim=True).values
+        x   = x * self.spatial_att(torch.cat([avg, mx], dim=1))
+        return x
 
 
 class UpBlock(nn.Module):
-    """Bilinear upsample → concat skip → Conv."""
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+    """Bilinear upsample → concat skip → Conv → Dropout2d."""
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, dropout: float = 0.2):
         super().__init__()
         self.up   = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         self.conv = nn.Sequential(
             ConvBnRelu(in_ch + skip_ch, out_ch),
             ResBlock(out_ch),
+            nn.Dropout2d(dropout),
         )
 
     def forward(self, x, skip):
         x = self.up(x)
-        # Handle odd-sized feature maps
         if x.shape != skip.shape:
             x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
         return self.conv(torch.cat([x, skip], dim=1))
@@ -112,19 +132,21 @@ class ASPP(nn.Module):
 class ChangeModule(nn.Module):
     """
     Fuse before/during feature pairs:
-      difference + element-wise product + concatenation → Conv → ResBlock
+      difference + element-wise product + concatenation → Conv → ResBlock → CBAM
     """
     def __init__(self, feat_ch: int, out_ch: int):
         super().__init__()
         self.conv = nn.Sequential(
-            ConvBnRelu(feat_ch * 4, out_ch),   # diff, prod, f_b, f_d
+            ConvBnRelu(feat_ch * 4, out_ch),
             ResBlock(out_ch),
         )
+        self.attn = CBAM(out_ch)
 
     def forward(self, f_b, f_d):
         diff = f_b - f_d
         prod = f_b * f_d
-        return self.conv(torch.cat([diff, prod, f_b, f_d], dim=1))
+        x = self.conv(torch.cat([diff, prod, f_b, f_d], dim=1))
+        return self.attn(x)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,11 +157,27 @@ class TwinFloodNet(nn.Module):
     """
     Parameters
     ----------
-    s1_in_ch    : number of SAR input channels per image (default 4)
-    aux_in_ch   : auxiliary channels (terrain=2 + LULC one-hot=8 → 10); 0 = disabled
-    base_ch     : base feature width; encoder uses [base, 2x, 4x, 8x]
-    num_classes : 1 → binary flood segmentation (BCEWithLogitsLoss)
-                  2 → multi-class (CrossEntropyLoss) – flood / no-flood
+    s1_in_ch         : SAR input channels per image (default 4)
+    aux_in_ch        : auxiliary channels (terrain=2 + LULC one-hot=8 → 10); 0 = disabled
+    base_ch          : controls decoder output widths (decoders output max(base_ch, enc_ch//2))
+    num_classes      : 1 → binary segmentation
+    dropout          : Dropout2d probability in all UpBlocks (default 0.2)
+    encoder_name     : any smp-supported encoder, e.g. 'resnet34', 'efficientnet-b0'
+    encoder_weights  : 'imagenet' (default) or None (random init)
+
+    Encoder output channels (resnet34, depth=5, in_ch=4):
+        (4, 64, 64, 128, 256, 512)
+         ↑   ↑   ↑   ↑    ↑    ↑
+        /1  /2  /4  /8  /16  /32
+        input  skip features   bottleneck
+
+    The architecture auto-configures ChangeModules and decoder dimensions
+    from encoder.out_channels, so swapping the encoder name just works.
+
+    Deep supervision
+    ----------------
+    During training returns (main_logits, ds3_logits, ds2_logits).
+    During eval returns only main_logits — predict.py is unaffected.
     """
 
     def __init__(
@@ -148,29 +186,44 @@ class TwinFloodNet(nn.Module):
         aux_in_ch: int = 10,
         base_ch: int = 32,
         num_classes: int = 1,
+        dropout: float = 0.2,
+        encoder_name: str = "resnet34",
+        encoder_weights: Optional[str] = "imagenet",
     ):
         super().__init__()
-        c = base_ch
+        import segmentation_models_pytorch as smp
+
         self.num_classes = num_classes
 
-        # ── Shared encoder (applied to both before and during) ──────────────
-        self.enc1 = DownBlock(s1_in_ch, c)       # /2  → skip ch=c
-        self.enc2 = DownBlock(c, c * 2)          # /4  → skip ch=2c
-        self.enc3 = DownBlock(c * 2, c * 4)      # /8  → skip ch=4c
-        self.enc4 = DownBlock(c * 4, c * 8)      # /16 → skip ch=8c
+        # ── Pretrained encoder (shared Siamese branch) ───────────────────────
+        # smp automatically adapts the first conv for in_channels != 3
+        # by averaging pretrained RGB weights across channel dim then tiling.
+        self.encoder = smp.encoders.get_encoder(
+            encoder_name,
+            in_channels=s1_in_ch,
+            depth=5,
+            weights=encoder_weights,
+        )
+        enc_chs  = self.encoder.out_channels   # e.g. (4, 64, 64, 128, 256, 512)
+        skip_chs = enc_chs[1:-1]               # per-scale skip channels: finest → coarsest
+        bot_ch   = enc_chs[-1]                 # bottleneck channel count
+        n_skips  = len(skip_chs)               # 4 for depth=5
 
-        # ── Bottleneck with ASPP ─────────────────────────────────────────────
-        self.bottleneck = ASPP(c * 8, c * 8)     # operates on /16
+        # ── ASPP on bottleneck ───────────────────────────────────────────────
+        self.bottleneck = ASPP(bot_ch, bot_ch)
 
-        # ── Change modules at each scale ─────────────────────────────────────
-        self.ch4 = ChangeModule(c * 8, c * 8)
-        self.ch3 = ChangeModule(c * 4, c * 4)
-        self.ch2 = ChangeModule(c * 2, c * 2)
-        self.ch1 = ChangeModule(c,     c)
+        # ── ChangeModule at bottleneck and each skip scale ───────────────────
+        # change_bottleneck: applied to the deepest encoder features before ASPP
+        self.change_bottleneck = ChangeModule(bot_ch, bot_ch)
+        # change_modules[0]=finest skip … change_modules[-1]=coarsest skip
+        self.change_modules = nn.ModuleList([
+            ChangeModule(ch, ch) for ch in skip_chs
+        ])
 
         # ── Optional auxiliary injection (into bottleneck) ───────────────────
         self.use_aux = aux_in_ch > 0
         if self.use_aux:
+            c = base_ch
             self.aux_enc = nn.Sequential(
                 ConvBnRelu(aux_in_ch, c * 2),
                 nn.MaxPool2d(2, 2),
@@ -178,45 +231,68 @@ class TwinFloodNet(nn.Module):
                 nn.MaxPool2d(2, 2),
                 ConvBnRelu(c * 4, c * 8),
                 nn.MaxPool2d(2, 2),
-                ConvBnRelu(c * 8, c * 8),
+                ConvBnRelu(c * 8, bot_ch),
                 nn.MaxPool2d(2, 2),
+                nn.MaxPool2d(2, 2),   # 5 total pools → /32, matches encoder depth=5
             )
-            self.aux_fuse = ConvBnRelu(c * 16, c * 8, 1)  # 2×c8 → c8
+            self.aux_fuse = ConvBnRelu(bot_ch * 2, bot_ch, 1)
 
-        # ── Decoder ─────────────────────────────────────────────────────────
-        self.dec4 = UpBlock(c * 8, c * 4, c * 4)   # /16 → /8
-        self.dec3 = UpBlock(c * 4, c * 2, c * 2)   # /8  → /4
-        self.dec2 = UpBlock(c * 2, c,     c)        # /4  → /2
-        self.dec1 = UpBlock(c,     c,     c)        # /2  → /1
+        # ── Decoder — auto-configured from encoder channels ──────────────────
+        # Skip order for decoder: coarsest → finest  (reversed skip_chs)
+        rev_skip_chs = list(reversed(skip_chs))          # e.g. [256, 128, 64, 64]
+        dec_out_chs  = [max(base_ch, ch // 2) for ch in rev_skip_chs]  # [128, 64, 32, 32]
 
-        # ── Head ────────────────────────────────────────────────────────────
-        self.head = nn.Conv2d(c, num_classes, 1)
+        self.dec_blocks = nn.ModuleList()
+        in_ch = bot_ch
+        for skip_ch, out_ch in zip(rev_skip_chs, dec_out_chs):
+            self.dec_blocks.append(UpBlock(in_ch, skip_ch, out_ch, dropout=dropout))
+            in_ch = out_ch
 
-        self._init_weights()
+        # Final UpBlock: /2 → /1, uses raw averaged finest skip
+        self.dec_final = UpBlock(in_ch, skip_chs[0], base_ch, dropout=dropout)
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+        # ── Main head ────────────────────────────────────────────────────────
+        self.head = nn.Conv2d(base_ch, num_classes, 1)
 
-    def _encode(self, x):
-        """Run shared encoder; returns (bottleneck, [skip1..skip4])."""
-        x, s1 = self.enc1(x)
-        x, s2 = self.enc2(x)
-        x, s3 = self.enc3(x)
-        x, s4 = self.enc4(x)
-        x = self.bottleneck(x)
-        return x, [s1, s2, s3, s4]
+        # ── Deep supervision heads (training only) ───────────────────────────
+        # ds_head3: after dec_blocks[1] at /8   (dec_out_chs[1])
+        # ds_head2: after dec_blocks[2] at /4   (dec_out_chs[2])
+        self.ds_head3 = nn.Conv2d(dec_out_chs[1], num_classes, 1)
+        self.ds_head2 = nn.Conv2d(dec_out_chs[2], num_classes, 1)
+
+        self._init_decoder_weights()
+
+    def _init_decoder_weights(self):
+        """Initialise only decoder/head weights; encoder keeps pretrained weights."""
+        scratch_modules = [
+            self.bottleneck, self.change_bottleneck, self.change_modules,
+            self.dec_blocks, self.dec_final, self.head, self.ds_head3, self.ds_head2,
+        ]
+        if self.use_aux:
+            scratch_modules += [self.aux_enc, self.aux_fuse]
+        for module in scratch_modules:
+            for m in module.modules() if hasattr(module, "modules") else [module]:
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.ones_(m.weight)
+                    nn.init.zeros_(m.bias)
+
+    def encoder_parameters(self):
+        """Encoder params — trained at lower LR to preserve pretrained weights."""
+        return list(self.encoder.parameters())
+
+    def decoder_parameters(self):
+        """All non-encoder params — trained at full LR."""
+        enc_ids = {id(p) for p in self.encoder.parameters()}
+        return [p for p in self.parameters() if id(p) not in enc_ids]
 
     def forward(
         self,
         s1_before: torch.Tensor,
         s1_during: torch.Tensor,
         aux: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
         Parameters
         ----------
@@ -226,37 +302,62 @@ class TwinFloodNet(nn.Module):
 
         Returns
         -------
-        logits    : (B, num_classes, H, W)
+        eval  : main_logits  (B, num_classes, H, W)
+        train : (main_logits, ds3_logits, ds2_logits)
         """
-        # ── Encode both branches ──────────────────────────────────────────
-        bot_b, skips_b = self._encode(s1_before)
-        bot_d, skips_d = self._encode(s1_during)
+        # ── Encode both branches (shared weights) ─────────────────────────
+        feats_b = self.encoder(s1_before)   # list of 6: [input, /2, /4, /8, /16, /32]
+        feats_d = self.encoder(s1_during)
 
-        # ── Change at bottleneck ──────────────────────────────────────────
-        bot = self.ch4(bot_b, bot_d)             # (B, 8c, H/16, W/16)
+        # ── Change + ASPP at bottleneck (/32) ─────────────────────────────
+        bot = self.change_bottleneck(feats_b[-1], feats_d[-1])
+        bot = self.bottleneck(bot)
 
         # ── Optional auxiliary fusion ──────────────────────────────────────
         if self.use_aux and aux is not None:
-            aux_feat = self.aux_enc(aux)          # (B, 8c, H/16, W/16)
+            aux_feat = self.aux_enc(aux)
             if aux_feat.shape[-2:] != bot.shape[-2:]:
                 aux_feat = F.interpolate(
                     aux_feat, size=bot.shape[-2:], mode="bilinear", align_corners=False
                 )
             bot = self.aux_fuse(torch.cat([bot, aux_feat], dim=1))
 
-        # ── Change at skip connections ────────────────────────────────────
-        cs4 = self.ch3(skips_b[2], skips_d[2])   # (B, 4c, H/8)
-        cs3 = self.ch2(skips_b[1], skips_d[1])   # (B, 2c, H/4)
-        cs2 = self.ch1(skips_b[0], skips_d[0])   # (B,  c, H/2)
-        cs1 = (skips_b[0] + skips_d[0]) / 2      # (B, c, H/2) — averaged finest skip
+        # ── ChangeModule at each skip scale ───────────────────────────────
+        # feats[1:-1] = [/2, /4, /8, /16]; change_modules[i] matches feats[i+1]
+        change_skips = [
+            self.change_modules[i](feats_b[i + 1], feats_d[i + 1])
+            for i in range(len(self.change_modules))
+        ]
+        # change_skips[0]=finest(/2) … change_skips[-1]=coarsest(/16)
 
-        # ── Decode ────────────────────────────────────────────────────────
-        x = self.dec4(bot, cs4)
-        x = self.dec3(x,   cs3)
-        x = self.dec2(x,   cs2)
-        x = self.dec1(x,   cs1)
+        # Raw averaged finest skip for dec_final (/2)
+        avg_finest = (feats_b[1] + feats_d[1]) / 2
 
-        return self.head(x)                       # (B, num_classes, H, W)
+        # ── Decode coarsest → finest ───────────────────────────────────────
+        x = bot
+        dec_outputs = []
+        for i, dec_block in enumerate(self.dec_blocks):
+            skip = change_skips[-(i + 1)]   # coarsest first
+            x = dec_block(x, skip)
+            dec_outputs.append(x)
+
+        x    = self.dec_final(x, avg_finest)
+        # smp stem outputs at /2 (unlike the old scratch DownBlock which kept /1),
+        # so dec_final lands at /2 — one final 2x upsample restores full resolution.
+        x    = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        main = self.head(x)
+
+        if self.training:
+            h, w = main.shape[-2:]
+            ds3 = F.interpolate(
+                self.ds_head3(dec_outputs[1]), size=(h, w), mode="bilinear", align_corners=False
+            )
+            ds2 = F.interpolate(
+                self.ds_head2(dec_outputs[2]), size=(h, w), mode="bilinear", align_corners=False
+            )
+            return main, ds3, ds2
+
+        return main
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,6 +368,17 @@ def build_model(
     use_aux: bool = True,
     num_classes: int = 1,
     base_ch: int = 32,
+    dropout: float = 0.2,
+    encoder_name: str = "resnet34",
+    encoder_weights: Optional[str] = "imagenet",
 ) -> TwinFloodNet:
-    aux_ch = 10 if use_aux else 0   # 2 terrain + 8 LULC one-hot
-    return TwinFloodNet(s1_in_ch=4, aux_in_ch=aux_ch, base_ch=base_ch, num_classes=num_classes)
+    aux_ch = 10 if use_aux else 0
+    return TwinFloodNet(
+        s1_in_ch=4,
+        aux_in_ch=aux_ch,
+        base_ch=base_ch,
+        num_classes=num_classes,
+        dropout=dropout,
+        encoder_name=encoder_name,
+        encoder_weights=encoder_weights,
+    )

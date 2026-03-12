@@ -3,6 +3,7 @@ Loss functions for flood segmentation — AMP safe.
 
 All losses work directly on raw logits (no sigmoid before passing in).
 They handle the ignore index (255) internally.
+Logits are clamped to [-10, 10] before sigmoid to prevent inf/nan.
 """
 
 import torch
@@ -15,9 +16,9 @@ IGNORE_INDEX = 255
 def _flatten_logits(pred: torch.Tensor, target: torch.Tensor):
     """
     Returns (logits, targets) as 1-D float tensors, ignore pixels removed.
-    Works on raw logits — no sigmoid applied here.
+    Clamps logits to [-10, 10] to guard against inf/nan before sigmoid.
     """
-    pred   = pred.squeeze(1).float()           # (B,H,W)
+    pred   = pred.squeeze(1).float().clamp(-10, 10)   # guard inf/nan
     valid  = target != IGNORE_INDEX
     return pred[valid], target[valid].float()
 
@@ -29,7 +30,7 @@ class DiceLoss(nn.Module):
 
     def forward(self, pred, target):
         logits, tgt = _flatten_logits(pred, target)
-        prob  = torch.sigmoid(logits)          # sigmoid inside, float32
+        prob  = torch.sigmoid(logits)
         inter = (prob * tgt).sum()
         union = prob.sum() + tgt.sum()
         return 1.0 - (2.0 * inter + self.smooth) / (union + self.smooth)
@@ -70,7 +71,7 @@ class TverskyLoss(nn.Module):
 
 
 class DiceFocalLoss(nn.Module):
-    """Recommended default: equal mix of Dice + Focal. Fully AMP safe."""
+    """Equal mix of Dice + Focal. Fully AMP safe."""
     def __init__(self, dice_w=0.5, focal_w=0.5, focal_alpha=0.25, focal_gamma=2.0):
         super().__init__()
         self.dice_w  = dice_w
@@ -80,6 +81,32 @@ class DiceFocalLoss(nn.Module):
 
     def forward(self, pred, target):
         return self.dice_w * self.dice(pred, target) + self.focal_w * self.focal(pred, target)
+
+
+class TverskyFocalLoss(nn.Module):
+    """
+    Tversky (alpha=0.3, beta=0.7) + Focal — the recommended default.
+    Tversky with beta > alpha penalises false negatives more than false
+    positives, improving recall for rare flood pixels.
+    """
+    def __init__(
+        self,
+        tversky_w: float = 0.5,
+        focal_w:   float = 0.5,
+        tversky_alpha: float = 0.3,
+        tversky_beta:  float = 0.7,
+        focal_alpha:   float = 0.25,
+        focal_gamma:   float = 2.0,
+    ):
+        super().__init__()
+        self.tversky_w = tversky_w
+        self.focal_w   = focal_w
+        self.tversky   = TverskyLoss(alpha=tversky_alpha, beta=tversky_beta)
+        self.focal     = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+
+    def forward(self, pred, target):
+        return (self.tversky_w * self.tversky(pred, target)
+                + self.focal_w * self.focal(pred, target))
 
 
 class ComboLoss(nn.Module):

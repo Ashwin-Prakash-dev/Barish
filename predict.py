@@ -76,10 +76,17 @@ def main():
     # ── Load checkpoint ───────────────────────────────────────────────────────
     ckpt = torch.load(args.checkpoint, map_location=device)
     saved_args = ckpt.get("args", {})
-    use_aux = not (args.no_aux or not saved_args.get("use_aux", True))
-    base_ch = saved_args.get("base_ch", 32)
+    use_aux         = not (args.no_aux or not saved_args.get("use_aux", True))
+    base_ch         = saved_args.get("base_ch", 32)
+    dropout         = saved_args.get("dropout", 0.2)
+    encoder_name    = saved_args.get("encoder", "resnet34")
+    enc_w_arg       = saved_args.get("encoder_weights", "imagenet")
+    encoder_weights = None if enc_w_arg == "none" else enc_w_arg
 
-    model = build_model(use_aux=use_aux, base_ch=base_ch).to(device)
+    model = build_model(
+        use_aux=use_aux, base_ch=base_ch, dropout=dropout,
+        encoder_name=encoder_name, encoder_weights=encoder_weights,
+    ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     print(f"Loaded checkpoint (epoch {ckpt['epoch']+1}, best IoU={ckpt.get('best_iou', '?')})")
